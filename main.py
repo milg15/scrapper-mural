@@ -1,10 +1,8 @@
-from selenium import webdriver  # Import from selenium
-from webdriver_manager.chrome import ChromeDriverManager
-from selenium.webdriver.chrome.options import Options
-import os
-import time
+from dotenv import load_dotenv
 import requests
+import time
 import json
+import os
 
 class SessionStorage:
     def __init__(self, driver) :
@@ -29,20 +27,72 @@ class SessionStorage:
 """
 Create a new instance of the Chromium driver
 """
-def config_browser():
+def config_browser_local():
+    from selenium import webdriver  # Import from selenium
+    from webdriver_manager.chrome import ChromeDriverManager
+    from selenium.webdriver.chrome.options import Options
+
+    options = Options() 
+    options.add_argument("window-size=1400,600")
+    options.add_argument('log-level=3')
+    options.add_argument("--disable-dev-shm-usage")
+    options.add_argument("--no-sandbox")
+    options.headless = True
+    driver = webdriver.Chrome(executable_path=ChromeDriverManager().install(), options=options)
+    return driver
+
+def config_browser_server():
+    from selenium import webdriver
+
     chrome_options = webdriver.ChromeOptions()
     chrome_options.binary_location = os.environ.get("GOOGLE_CHROME_BIN")
     chrome_options.add_argument("--headless")
     chrome_options.add_argument("--disable-dev-shm-usage")
     chrome_options.add_argument("--no-sandbox")
     driver = webdriver.Chrome(executable_path=os.environ.get("CHROMEDRIVER_PATH"), chrome_options=chrome_options)
-    return driver
+
+# Now you can start using Selenium
 
 def split_url(url):
     #the url has to be the visitor link and most allow anyone to see the link.
     details = url.split('/m/')[1].split('/')
     #return error here if i can't get the data.
     return (details[0] , details[1])
+
+from faunadb import query as q
+from faunadb.objects import Ref
+from faunadb.client import FaunaClient
+def get_token_from_db(): 
+    secret = os.environ.get("FAUNADB_SECRET")
+    #os.getenv('FAUNADB_SECRET')
+    client = FaunaClient(secret=secret)
+
+    data = client.query(
+        q.paginate(
+            q.match(
+                q.index("token_by_date")
+            )
+        )
+    )['data']
+
+    token = data[-1][1]
+    return f"Bearer {token}"
+
+def add_new_token_to_db(token):
+    from datetime import datetime, timezone
+    now = datetime.now(timezone.utc)
+
+    secret = os.environ.get("FAUNADB_SECRET")
+    #os.getenv('FAUNADB_SECRET')
+    client = FaunaClient(secret=secret)
+    client.query(
+        q.create(
+            q.collection("token"),
+            {"data": {"token": token.replace('Bearer ', ''), "creation": now}}
+        )
+    )
+
+    print ("Added token to db")
 
 def get_token(url, driver):
     # Go to the Mural home page.
@@ -74,37 +124,56 @@ def get_mural_information(token, user, id):
         return clean['widgets']
         
 def generate_csv(notes):
+    valid_notes = {"notes": []}
     for key in notes:
         note = notes[key]
         if ('murally.widget.TextWidget' in note['type']):
             properties = note['properties']
             if (len(properties['text'])>0):
-                print (key, properties['backgroundColor'], properties['text'])
-    return "CSV_FILE"
+                valid_notes['notes'].append({
+                    "backgroundColor": properties['backgroundColor'], 
+                    "text": properties['text']
+                })
+    return valid_notes
 
 def get_info(token, mural_user, mural_id):
     notes = get_mural_information(token, mural_user, mural_id)
     if (len(notes)>0):
-        generate_csv(notes)
-        return True
+        return generate_csv(notes)
     return False
 
 def main(url):
     mural_user, mural_id = split_url(url)
-    token = "1"
+    token = get_token_from_db()
 
-    if (get_info(token, mural_user, mural_id)):
-        print("Works")
+    data = get_info(token, mural_user, mural_id)
+    if (data):
+        return data
     else:
         driver = config_browser()
         token = get_token(url, driver)
-        if (get_info(token, mural_user, mural_id)):
-            print ("Save new token in database")
+        data = get_info(token, mural_user, mural_id)
+        if (data):
+            add_new_token_to_db(token)
+            return data    
         else: 
-            print ("ERROR! Enviar notificacion a host.")
-
-if __name__ == '__main__':
-    #Todo save the token in a database if the token doesn't work create a new one.
-    url = 'https://app.mural.co/t/jbrock5296/m/jbrock5296/1605660756092/11f05c8e617c26182856f1dd6c6b240928b8cd7c'
-    main(url)
+            return "ERROR! Enviar notificacion a host."
     
+import flask
+from flask import request, jsonify
+
+app = flask.Flask(__name__)
+
+@app.route('/', methods=['GET'])
+def home():
+    return "<h1>Distant Reading Archive</h1><p>This site is a prototype API for distant reading of science fiction novels!</p>"
+
+@app.route('/api/v1/notes', methods=['GET'])
+def api_notes():
+    if 'url' in request.args:
+        url = request.args['url']
+        return main(url)
+    else:
+        return "Error: No url provided. Please specify an url."
+
+app.run()
